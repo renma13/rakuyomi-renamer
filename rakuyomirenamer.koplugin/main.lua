@@ -1,12 +1,18 @@
 local bit = require("bit")
 local DataStorage = require("datastorage")
 local ffiutil = require("ffi/util")
+local BD = require("ui/bidi")
+local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
+local ButtonDialog = require("ui/widget/buttondialog")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local _ = require("gettext")
+
+local Screen = Device.screen
 
 local band, bor, bxor, bnot = bit.band, bit.bor, bit.bxor, bit.bnot
 local rshift, lshift, rrotate = bit.rshift, bit.lshift, bit.ror
@@ -175,13 +181,135 @@ local function show_message(text)
     UIManager:show(InfoMessage:new({ text = text, timeout = 6 }))
 end
 
+local function is_cbz(file)
+    return type(file) == "string" and file:lower():match("%.cbz$")
+end
+
+local function current_page(ui)
+    if ui and ui.getCurrentPage then
+        return ui:getCurrentPage()
+    end
+    return nil
+end
+
 function RakuyomiRenamer:init()
-    if self.ui.name ~= "ReaderUI" then
+    if self.ui.name == "ReaderUI" then
+        if self.ui.document and is_cbz(self.ui.document.file) then
+            self.ui.menu:registerToMainMenu(self)
+            local pending_file = G_reader_settings:readSetting("rakuyomi_renamer_cover_pick_file")
+            if pending_file == self.ui.document.file then
+                self.cover_pick_active = true
+                self.ui:registerPostReaderReadyCallback(function()
+                    UIManager:nextTick(function()
+                        self:showCoverPickPrompt()
+                    end)
+                end)
+            end
+        end
+    else
         self.ui.menu:registerToMainMenu(self)
+        if self.ui.addFileDialogButtons then
+            self.ui:addFileDialogButtons("rakuyomi_renamer_cover_picker", function(file, is_file)
+                if not is_file or not is_cbz(file) then
+                    return nil
+                end
+                return {
+                    {
+                        text = _("Open to pick cover page"),
+                        callback = function()
+                            if self.ui.file_dialog then
+                                UIManager:close(self.ui.file_dialog)
+                            end
+                            G_reader_settings:saveSetting("rakuyomi_renamer_cover_pick_file", file)
+                            local filemanagerutil = require("apps/filemanager/filemanagerutil")
+                            filemanagerutil.openFile(self.ui, file, function()
+                                show_message(_("Cover picking mode started. Turn pages and use the prompt to choose the cover."))
+                            end, true)
+                        end,
+                    },
+                }
+            end)
+        end
     end
 end
 
+function RakuyomiRenamer:onPageUpdate()
+    if self.cover_pick_active then
+        UIManager:nextTick(function()
+            self:showCoverPickPrompt()
+        end)
+    end
+end
+
+function RakuyomiRenamer:showCoverPickPrompt()
+    if not self.cover_pick_active or not self.ui.document then
+        return
+    end
+
+    local file = self.ui.document.file
+    local page = current_page(self.ui) or "?"
+    if self.last_cover_pick_prompt_page == page then
+        return
+    end
+    self.last_cover_pick_prompt_page = page
+
+    local dialog
+    dialog = ButtonDialog:new({
+        title = _("Use this page as the cover?") .. "\n\n" ..
+            BD.filename(file:match("([^/]+)$") or file) .. "\n" ..
+            _("Page ") .. tostring(page),
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = _("Use this page"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        G_reader_settings:delSetting("rakuyomi_renamer_cover_pick_file")
+                        self.cover_pick_active = false
+                        self:useCurrentPageAsCover()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Keep looking"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        G_reader_settings:delSetting("rakuyomi_renamer_cover_pick_file")
+                        self.cover_pick_active = false
+                        show_message(_("Cover picking cancelled."))
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(dialog)
+end
+
 function RakuyomiRenamer:addToMainMenu(menu_items)
+    if self.ui.name == "ReaderUI" then
+        menu_items.rakuyomi_renamer = {
+            text = _("Rakuyomi Renamer"),
+            sorting_hint = "main",
+            sub_item_table = {
+                {
+                    text = _("Use current page as cover"),
+                    callback = function()
+                        self:useCurrentPageAsCover()
+                    end,
+                },
+            },
+        }
+        return
+    end
+
     menu_items.rakuyomi_renamer = {
         text = _("Rakuyomi Renamer"),
         sorting_hint = "tools",
@@ -189,6 +317,43 @@ function RakuyomiRenamer:addToMainMenu(menu_items)
             self:scanAndConfirm()
         end,
     }
+end
+
+function RakuyomiRenamer:setCustomCover(file, image_file)
+    local bookinfo = self.ui.bookinfo
+    if bookinfo and bookinfo.setCustomCoverFromImage then
+        bookinfo:setCustomCoverFromImage(file, image_file)
+    else
+        local DocSettings = require("docsettings")
+        if not DocSettings:flushCustomCover(file, image_file) then
+            show_message(_("Could not save custom cover."))
+            return
+        end
+        UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", file))
+        UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
+    end
+    show_message(_("Custom cover saved."))
+end
+
+function RakuyomiRenamer:useCurrentPageAsCover()
+    if not self.ui.document or not is_cbz(self.ui.document.file) then
+        show_message(_("Open a CBZ chapter first."))
+        return
+    end
+
+    local file = self.ui.document.file
+    local page = current_page(self.ui) or "current"
+    local cache_dir = DataStorage:getDataDir() .. "/cache"
+    os.execute("mkdir -p " .. shell_quote(cache_dir))
+    local screenshot_name = cache_dir .. "/rakuyomi-renamer-cover-" ..
+        tostring(os.time()) .. "-p" .. tostring(page) .. ".png"
+
+    self.ui:handleEvent(Event:new("CloseReaderMenu"))
+    UIManager:nextTick(function()
+        Screen:shot(screenshot_name)
+        self:setCustomCover(file, screenshot_name)
+        os.remove(screenshot_name)
+    end)
 end
 
 function RakuyomiRenamer:getRakuyomiBackend()
